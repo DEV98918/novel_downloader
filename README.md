@@ -7,91 +7,104 @@
 <a name="english"></a>
 ## English
 
-A robust Python script designed to automatically download serialized novels from online catalog sources (such as `shuhaoxs.com`), featuring automatic multi-page chapter stitching, rate-limit management, and clean text output.
+A Python script that downloads serialized novels from an online catalog
+(e.g. `https://www.shuhaoxs.com/book/t0yp00p.html`), stitches multi-page
+chapters automatically, strips advertisements and unrelated links, and merges
+the chosen chapters into a single `.txt` file.
 
 ### Features
-- **Multi-page Stitching**: Automatically detects and concatenates multi-page chapters (e.g., `-2.html`, `-3.html`) into a single cohesive text.
-- **Rate Limit Protection**: Built-in request delays to prevent server-side rate-limiting and bans (`ApiError` prevention).
-- **Clean Output**: Automatically strips unwanted HTML tags, scripts, and advertisements, outputting clean plain text.
+- **Chapter range**: downloads chapters 1–100 by default (`--start` / `--end` / `--all`).
+- **Multi-page stitching**: follows the page's "下一页" link, page links listed in
+  the catalog (`xxx-2.html`), and — only for paged chapters — the next `-N` page,
+  verifying the page title so it never strays into the following chapter.
+- **Content cleaning**: keeps only the article text; drops `<script>`, `<ins>` ads,
+  inline ad images, navigation bars, promo lines, URLs and HTML comments.
+- **WAF CAPTCHA**: the site is protected by GoEdge WAF. On the first run the script
+  shows the CAPTCHA in your terminal (character art) and opens the image with your
+  default viewer; the verification cookie is stored in `cookies.json` and reused.
+- **Resilient**: retries on connection errors/timeouts/5xx, retries failed chapters,
+  supports `--resume`, and writes the output atomically (no half-written files).
 
-### Installation & Setup
-
-1. Clone the repository and navigate to the project folder:
-   ```
-   git clone [https://github.com/your-username/novel-downloader.git](https://github.com/your-username/novel-downloader.git)
-   cd novel-downloader
-   ```
-2. Create and activate a Python virtual environment:
-
-```
+### Setup
+```bash
 python3 -m venv venv
 source venv/bin/activate
+pip install -r requirements.txt
 ```
 
-3. Install dependencies:
-
-```
-pip install requests beautifulsoup4
-```
 ### Usage
-
-1. Open download.py and update the INDEX_URL with your target novel's catalog page URL.
-
-2. Run the script:
 ```bash
-
-python download.py
+python novel_download.py                     # chapters 1-100 -> 小说_1-100章.txt
+python novel_download.py --end 200           # chapters 1-200
+python novel_download.py --start 50 --end 120 -o out.txt
+python novel_download.py --all               # every chapter in the catalog
+python novel_download.py --dry-run           # list parsed chapters only
+python novel_download.py --resume            # skip chapters already in the output
 ```
 
-3. The complete novel text will be saved as a clean .txt file in the directory.
+Exit codes: `0` success, `1` some chapters failed, `2` bad arguments,
+`3` CAPTCHA failed / not interactive, `4` robots.txt disallowed, `5` network error.
+
+### Tests
+Offline tests run against a local mock site that reproduces the WAF CAPTCHA and
+the catalog/chapter structure:
+```bash
+python -m unittest discover -s tests -v
+```
+
+---
+
+<a name="中文"></a>
 ## 中文
 
-一个基于 Python 编写的现代化小说自动下载脚本，专为抓取连载小说而设计。支持多页章节自动拼接、请求频率控制（防封禁）以及正文净化。
+从小说目录页抓取章节，自动拼接多页章节、过滤广告与无关链接，
+把指定章节合并成一个 TXT 文件。
 
-### 功能特点
+### 功能
+- **章节区间**：默认抓取第 1–100 章，可用 `--start` / `--end` / `--all` 调整。
+- **多页拼接**：依次使用页内「下一页」链接、目录中列出的分页（`xxx-2.html`），
+  以及（仅对分页格式的章节）`-N` 下一页探测，并用页面标题校验，不会串到下一章。
+- **正文净化**：只保留正文，自动去掉 `<script>`、`<ins>` 广告、内联广告图、
+  导航条（上一章/下一章/目录）、推广语、网址和 HTML 注释。
+- **WAF 人机验证**：目标站由 GoEdge WAF 保护。首次运行会在终端显示验证码字符画
+  （同时用系统图片查看器打开图片），输入一次后验证 Cookie 保存在 `cookies.json`，
+  后续自动复用。
+- **健壮性**：连接失败/超时/5xx 自动重试，失败章节重试一轮，支持 `--resume` 断点续传，
+  输出文件原子写入（中断不会留下半截文件）。
 
-- **多页章节拼接**：针对单章内容被拆分多个页面的网站（如 `-2.html`, `-3.html` 等），能够自动循环追踪并无缝拼接为完整章节。
-- **智能限流防护**：内置请求延迟设置，有效避免触发服务器端防刷频限制（`ApiError`）。
-- **内容净化**：自动过滤网页脚本、广告及无关标签，输出排版整洁的纯文本。
+### 安装
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-### 安装与配置
+### 使用
+```bash
+python novel_download.py                     # 第 1-100 章 -> 小说_1-100章.txt
+python novel_download.py --end 200           # 第 1-200 章
+python novel_download.py --start 50 --end 120 -o out.txt
+python novel_download.py --all               # 目录中的全部章节
+python novel_download.py --dry-run           # 只解析目录并打印章节列表
+python novel_download.py --resume            # 跳过输出文件中已有的章节
+```
 
-1. 克隆仓库并进入项目目录：
+退出码：`0` 成功，`1` 部分章节失败，`2` 参数错误，`3` 验证码失败/非交互终端，
+`4` robots.txt 不允许，`5` 网络错误。
 
+### 关于 V0.1 不能运行的原因
+1. 目标站有 GoEdge WAF 图形验证码，V0.1 直接 `requests.get` 只能拿到验证页（307 跳转），
+   没有任何验证流程。
+2. 依赖未安装（`bs4` 缺失）。
+3. 正文选择器 `.content, #content` 与目录选择器写死，站点结构变化就抓不到内容。
+4. 分页只靠 `-2.html` 猜测，遇到目录只列第一页或章节 ID 本身带数字时会漏页/串章。
+5. 异常全部吞掉（`except: break`），失败时静默产出空内容或半截文件。
 
-   ```
-   git clone [https://github.com/你的用户名/novel-downloader.git](https://github.com/你的用户名/novel-downloader.git)
-   cd novel-downloader
-   ```
-
-2. 创建并激活 Python 虚拟环境：
-
-
-
-   ```
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-
-3. 安装依赖库：
-
-
-
-   ```
-   pip install requests beautifulsoup4
-   ```
-
-### 使用方法
-
-1. 打开 `download.py`，将 `INDEX_URL` 修改为你想要下载的小说目录页网址。
-
-2. 运行脚本：
-
-   ```
-   python download.py
-   ```
-
-3. 下载完成后，程序会自动在同目录下生成格式整洁的 `.txt` 小说全集文件。
+### 测试
+离线测试运行在本地模拟站点上（还原 WAF 验证码与目录/章节结构）：
+```bash
+python -m unittest discover -s tests -v
+```
 
 ### License
 
