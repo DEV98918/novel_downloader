@@ -17,20 +17,20 @@ A robust Python script designed to automatically download serialized novels from
 ### Installation & Setup
 
 1. Clone the repository and navigate to the project folder:
-   ```bash
+   ```
    git clone [https://github.com/your-username/novel-downloader.git](https://github.com/your-username/novel-downloader.git)
    cd novel-downloader
-```
+   ```
 2. Create and activate a Python virtual environment:
 
-```bash
+```
 python3 -m venv venv
 source venv/bin/activate
 ```
 
 3. Install dependencies:
 
-```bash
+```
 pip install requests beautifulsoup4
 ```
 ### Usage
