@@ -783,6 +783,9 @@ class NovelDownloader:
             )
             return []
 
+        # 缺加密依赖时必须立即失败：否则只下载到默认区间，用户会误以为成功了
+        chapter_api.require_crypto()
+
         base = f"{urlsplit(page_url).scheme}://{host}"
         pages = [opt.page for opt in options]
         logging.info(
@@ -815,6 +818,13 @@ class NovelDownloader:
                 result.chapters.extend(more.chapters)
                 logging.info("菜单之外还有 %d 个区间，已一并抓取。", len(extra_pages))
 
+        if not result.chapters:
+            # 一个区间都没成功：不能让用户以为「只有 100 章」
+            detail = "；".join(result.errors[:3]) if result.errors else "接口未返回任何章节"
+            raise chapter_api.RangeApiError(
+                "识别到分章区间菜单，但未能从分章接口取到任何章节：" + detail +
+                "\n此时只会下载默认区间。若确认密钥已更新，请用 NOVEL_RANGE_API 环境变量覆盖配置。"
+            )
         logging.info("分章接口返回 %d 章。", len(result.chapters))
         return [
             site_adapter.TocEntry(title, requests.compat.urljoin(page_url, href), order)
@@ -1351,6 +1361,33 @@ def is_chapter_heading(line: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+INSTALL_HINT = (
+    "请先安装依赖（装到你运行脚本所用的那个 Python 环境里）：\n"
+    "    pip install -r requirements.txt\n"
+    "若使用虚拟环境，请先激活：source venv/bin/activate"
+)
+
+
+def missing_dependencies() -> list[str]:
+    """检查运行所需依赖，返回缺失项列表。
+
+    requests / beautifulsoup4 在模块顶部已 import，缺少它们脚本无法启动
+    （会直接 ImportError），因此这里只需确认加密能力可用——内置纯 Python
+    实现保证通常恒为可用；若连它也失效，才真正无法解析分章区间。
+    """
+    return [] if chapter_api.crypto_available() else ["可用 AES 实现"]
+
+
+def preflight_check(*, need_crypto: bool) -> str | None:
+    """启动前检查依赖；need_crypto=False 时允许缺 pycryptodome（仅影响分章区间）。"""
+    missing = missing_dependencies()
+    if not need_crypto:
+        missing = [m for m in missing if m != "pycryptodome"]
+    if not missing:
+        return None
+    return f"缺少依赖：{', '.join(missing)}\n{INSTALL_HINT}\n当前解释器：{sys.executable}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="从小说站点抓取章节并合并为 TXT 文件（v0.3：任意小说站 + 并发下载）。",
@@ -1434,9 +1471,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"参数错误：{exc}", file=sys.stderr)
         return 2
 
+    # 启动即检查依赖（pycryptodome 只有遇到分章区间时才必需）
+    problem = preflight_check(need_crypto=False)
+    if problem:
+        print(f"错误：{problem}", file=sys.stderr)
+        return 6
+    backend = chapter_api.crypto_backend()
+    if backend != "pycryptodome":
+        # 不影响功能：内置纯 Python AES 可用；提示仅为性能/环境说明
+        logging.info(
+            "加密后端：%s（未安装 pycryptodome，已自动使用内置实现，功能不受影响）", backend
+        )
+
     downloader = NovelDownloader(settings)
     try:
         return downloader.run(dry_run=args.dry_run)
+    except chapter_api.MissingCryptoDependency as exc:
+        print(f"\n错误：{exc}", file=sys.stderr)
+        return 6
+    except chapter_api.RangeApiError as exc:
+        print(f"\n错误：{exc}", file=sys.stderr)
+        print("提示：如只需默认区间，可加 --no-range-api 跳过。", file=sys.stderr)
+        return 7
     except WafVerificationRequired as exc:
         print(f"\n错误：{exc}", file=sys.stderr)
         return 3

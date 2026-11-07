@@ -76,7 +76,8 @@ python novel_download.py --url ... --resume                     # skip chapters 
 | `--dry-run` | parse and list chapters only |
 
 Exit codes: `0` success, `1` some chapters failed, `2` bad arguments,
-`3` CAPTCHA failed / not interactive, `4` robots.txt disallowed, `5` network error.
+`3` CAPTCHA failed / not interactive, `4` robots.txt disallowed, `5` network error,
+`6` missing dependency, `7` range endpoint returned no chapters.
 
 ### Tests
 Offline tests run against local mock sites (two different templates, plus a WAF CAPTCHA):
@@ -151,7 +152,7 @@ python novel_download.py --url ... --resume                     # 跳过已保�
 | `--dry-run` | 只解析并列出章节 |
 
 退出码：`0` 成功，`1` 部分章节失败，`2` 参数错误，`3` 验证码失败/非交互终端，
-`4` robots.txt 不允许，`5` 网络错误。
+`4` robots.txt 不允许，`5` 网络错误，`6` 缺少依赖，`7` 分章接口未取到章节。
 
 ### 关于 V0.1 不能运行的原因
 1. 目标站有 GoEdge WAF 图形验证码，V0.1 直接 `requests.get` 只能拿到验证页（307 跳转），
@@ -172,6 +173,9 @@ python novel_download.py --url ... --resume                     # 跳过已保�
 
 ### 分章区间接口说明
 - 脚本内置了目标站的加密接口配置（密钥/IV 来自站点自身前端 JS 的 `AESCrypt`）。
+- **加密不依赖第三方库**：依次尝试 `pycryptodome` → `cryptography` → 内置纯 Python AES，
+  三者结果完全一致（已用 FIPS-197 标准向量校验）。因此即使没装任何加密库，
+  100 章之后的章节也能正常下载。推荐安装 `pycryptodome` 只为速度。
 - 站点更新密钥后若失效，可用环境变量覆盖，无需改代码：
   ```bash
   export NOVEL_RANGE_API='{"endpoint":"/index.php?action=loadChapterPage","key":"<32位密钥>","iv":"<16位IV>"}'

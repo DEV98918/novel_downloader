@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -103,6 +104,99 @@ class EncryptionTests(unittest.TestCase):
 
     def test_parse_returns_none_for_missing_config(self):
         self.assertIsNone(chapter_api.parse_api_from_js("var x = 1;"))
+
+
+class CryptoBackendTests(unittest.TestCase):
+    """回归：缺少 pycryptodome 时不能导致 100 章之后无法下载。
+
+    三种后端（pycryptodome / cryptography / 内置纯 Python）必须输出一致，
+    且内置实现在无任何第三方加密库时仍可用。
+    """
+
+    def setUp(self) -> None:
+        self.api = chapter_api.api_for_host("www.shuhaoxs.com")
+        self.plain = b'{"id":"t0yp00p","page":3}'
+        self.expected = "v95hOEdJeR834PDYcie8rrVTBorsiUA4jhbT+6zpW9I="
+
+    def test_pure_python_matches_reference(self):
+        token = base64.b64encode(chapter_api._encrypt_pure(self.api.key, self.api.iv, self.plain)).decode()
+        self.assertEqual(token, self.expected)
+
+    def test_pure_python_matches_pycryptodome(self):
+        reference = chapter_api._encrypt_pycryptodome(self.api.key, self.api.iv, self.plain)
+        self.assertEqual(chapter_api._encrypt_pure(self.api.key, self.api.iv, self.plain), reference)
+
+    def test_pure_python_fips197_vectors(self):
+        """FIPS-197 标准测试向量，确认内置 AES 实现正确。"""
+        block = bytes.fromhex("00112233445566778899aabbccddeeff")
+        self.assertEqual(
+            chapter_api._encrypt_block(block, chapter_api._expand_key(bytes(range(16)))).hex(),
+            "69c4e0d86a7b0430d8cdb78070b4c55a",
+        )
+        self.assertEqual(
+            chapter_api._encrypt_block(block, chapter_api._expand_key(bytes(range(32)))).hex(),
+            "8ea2b7ca516745bfeafc49904b496089",
+        )
+
+    def test_pure_python_roundtrip(self):
+        data = b"hello world " * 10
+        enc = chapter_api._aes_cbc_encrypt(self.api.key, self.api.iv, chapter_api._pkcs7_pad(data))
+        self.assertEqual(chapter_api._decrypt_pure(self.api.key, self.api.iv, enc), data)
+
+    def test_backend_falls_back_without_pycryptodome(self):
+        """模拟未安装 pycryptodome / cryptography：仍应选出可用后端并产出正确 token。"""
+        blocked = {k: None for k in (
+            "Crypto", "Crypto.Cipher", "Crypto.Util", "Crypto.Util.Padding",
+            "cryptography", "cryptography.hazmat",
+        )}
+        with mock.patch.dict(sys.modules, blocked), mock.patch.object(chapter_api, "_BACKENDS", None):
+            self.assertIn(chapter_api.crypto_backend(), ("cryptography", "pure-python"))
+            self.assertTrue(chapter_api.crypto_available())
+            self.assertEqual(chapter_api.encrypt_payload(self.api, "t0yp00p", 3), self.expected)
+
+    def test_decrypt_roundtrip_any_backend(self):
+        token = chapter_api.encrypt_payload(self.api, "t0yp00p", 42)
+        self.assertEqual(chapter_api.decrypt_payload(self.api, token), {"id": "t0yp00p", "page": 42})
+
+
+class RangeApiWithoutPycryptodomeTests(unittest.TestCase):
+    """端到端：在屏蔽 pycryptodome 的环境里，跨区间下载仍须成功。"""
+
+    def setUp(self) -> None:
+        self.server, self.state, self.base = start_in_thread()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workdir = Path(self.tmp.name)
+        env = {
+            "NOVEL_RANGE_API": json.dumps({
+                "endpoint": "/range/index.php?action=loadChapterPage",
+                "key": mock_server.RANGE_KEY.decode(),
+                "iv": mock_server.RANGE_IV.decode(),
+            })
+        }
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_downloads_beyond_100_without_pycryptodome(self):
+        blocked = {k: None for k in (
+            "Crypto", "Crypto.Cipher", "Crypto.Util", "Crypto.Util.Padding",
+            "cryptography", "cryptography.hazmat",
+        )}
+        out = self.workdir / "b.txt"
+        argv = ["--url", f"{self.base}/range/book/{mock_server.RANGE_BOOK_ID}.html",
+                "--cookies", str(self.workdir / "c.json"), "--delay", "0.01", "--ignore-robots",
+                "--start", "101", "--end", "105", "--output", str(out)]
+        with mock.patch.dict(sys.modules, blocked), mock.patch.object(chapter_api, "_BACKENDS", None):
+            out_s, err_s = io.StringIO(), io.StringIO()
+            with redirect_stdout(out_s), redirect_stderr(err_s):
+                code = nd.main(argv)
+            self.assertEqual(code, 0, out_s.getvalue() + err_s.getvalue())
+            text = out.read_text(encoding="utf-8")
+        for n in range(101, 106):
+            self.assertIn(mock_server.range_chapter_title(n), text, f"缺少第 {n} 章")
 
 
 class RangeApiTests(unittest.TestCase):

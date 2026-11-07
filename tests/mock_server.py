@@ -26,6 +26,14 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+# 测试会在 sys.modules 里屏蔽 Crypto 来模拟「未安装 pycryptodome」的客户端，
+# 这会连带影响服务端。这里先取出真实模块引用，供加密/解密使用。
+try:  # pragma: no cover - 环境探测
+    import Crypto.Cipher.AES as _AES  # noqa: E402,F401
+    import Crypto.Util.Padding as _Padding  # noqa: E402,F401
+except ImportError:  # pragma: no cover
+    _AES = _Padding = None
+
 TOTAL_CHAPTERS = 120
 BOOK_ID = "t0yp00p"
 CHAPTER_CODES = [f"t0yp00p-{96 + i}" for i in range(TOTAL_CHAPTERS)]  # t0yp00p-96.html ...
@@ -299,22 +307,16 @@ def encrypt_range_payload(book_id: str, page: int) -> str:
     import base64
     import json as _json
 
-    from Crypto.Cipher import AES
-    from Crypto.Util.Padding import pad
-
     plain = _json.dumps({"id": book_id, "page": page}, separators=(",", ":")).encode()
-    return base64.b64encode(AES.new(RANGE_KEY, AES.MODE_CBC, RANGE_IV).encrypt(pad(plain, 16))).decode()
+    return base64.b64encode(_AES.new(RANGE_KEY, _AES.MODE_CBC, RANGE_IV).encrypt(_Padding.pad(plain, 16))).decode()
 
 
 def decrypt_range_payload(token: str) -> dict:
     import base64
     import json as _json
 
-    from Crypto.Cipher import AES
-    from Crypto.Util.Padding import unpad
-
-    raw = AES.new(RANGE_KEY, AES.MODE_CBC, RANGE_IV).decrypt(base64.b64decode(token))
-    return _json.loads(unpad(raw, 16).decode())
+    raw = _AES.new(RANGE_KEY, _AES.MODE_CBC, RANGE_IV).decrypt(base64.b64decode(token))
+    return _json.loads(_Padding.unpad(raw, 16).decode())
 
 
 def range_api_response(data: dict) -> dict:

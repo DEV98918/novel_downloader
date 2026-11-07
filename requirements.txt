@@ -1,3 +1,5 @@
 requests>=2.31
 beautifulsoup4>=4.12
+# 可选：分章区间加密的加速后端。脚本内置纯 Python AES 兜底，
+# 不装也能正常下载 100 章之后的章节。
 pycryptodome>=3.19
