@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""小说章节下载器 / Novel chapter downloader.
+"""小说章节下载器 / Novel chapter downloader (v0.3).
 
 从小说目录页抓取章节，自动拼接多页章节、过滤广告与无关链接，
 合并为一个 TXT 文件。
 
-V0.2 相对 V0.1 的主要改动：
-1. 处理 GoEdge WAF 图形验证码：检测到验证页时在终端提示输入验证码，
-   验证 Cookie 持久化到本地，一次验证后自动复用。
-2. 正文选择器改为按正文长度择优选取（同时排除链接密集的外层容器），
-   清理 script/style/ins/iframe 等杂质，逐行过滤广告、网址、导航。
-3. 按目录顺序截取指定章节区间（默认第 1-100 章），失败章节自动重试，
-   支持断点续传。
-4. 连接失败、超时、5xx 自动重试；输出文件以原子方式写入，
-   失败时不会留下空文件或半截文件。
+v0.31 —— 支持任意小说站
+    新增 --url 参数：传入任意小说站的目录页网址即可。目录与正文不再依赖
+    某个站点写死的选择器，而是用「多模板候选 + 结构启发式」自动识别
+    （见 site_adapter.py），并支持目录页分页（--all-pages）。
+
+v0.32 —— 提速
+    - 多线程并发下载章节（--workers，默认 6）；
+    - 自适应限速：遇到 429/503 或验证码时自动拉长请求间隔，恢复后再加速
+      （见 concurrency.py）；
+    - 可选的页面磁盘缓存（--cache-dir），重跑/续传直接命中，避免重复请求。
 
 用法：
-    python novel_download.py                        # 第 1-100 章
-    python novel_download.py --start 1 --end 100    # 显式指定区间
-    python novel_download.py --all                  # 全部章节
-    python novel_download.py --dry-run              # 只抓目录，打印章节列表
-    python novel_download.py --resume               # 断点续传
+    python novel_download.py                                  # 内置目标站，第 1-100 章
+    python novel_download.py --url https://example.com/book/1.html
+    python novel_download.py --url ... --start 1 --end 50
+    python novel_download.py --url ... --all                  # 目录中的全部章节
+    python novel_download.py --url ... --dry-run              # 只解析目录
+    python novel_download.py --url ... --resume               # 断点续传
+    python novel_download.py --url ... --workers 8 --cache-dir .novel_cache
 
 依赖：requests、beautifulsoup4（见 requirements.txt）
 可选：Pillow（终端内显示验证码更清晰，非必需）
@@ -42,6 +45,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.robotparser
 import zlib
@@ -63,6 +67,17 @@ try:  # Windows 控制台可能是 GBK，尽量切换为 UTF-8
 except (AttributeError, OSError):
     pass
 
+# 通用站点适配（v0.31）与并发 / 限速 / 缓存（v0.32）
+import site_adapter
+from concurrency import RateLimiter, run_ordered
+from page_cache import PageCache
+from site_adapter import (
+    CHAPTER_TITLE_RE,
+    extract_next_page,
+    is_ad_line,
+    page_chapter_title,
+)
+
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
@@ -72,6 +87,8 @@ DEFAULT_OUTPUT = "小说_1-100章.txt"
 
 DEFAULT_START = 1
 DEFAULT_END = 100
+DEFAULT_WORKERS = 6              # 并发下载线程数（v0.32）
+MAX_WORKERS = 16
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -79,81 +96,15 @@ USER_AGENT = (
 )
 REQUEST_TIMEOUT = (10, 30)       # (连接超时, 读取超时) 秒
 MAX_RETRIES = 3                  # 连接失败/5xx 重试次数
-RETRY_BACKOFF = 2.0              # 重试退避秒数（指数增长）
-CHAPTER_DELAY = 0.8              # 章节间基础间隔（秒）
+RETRY_BACKOFF = 2.0              # 连接失败重试退避秒数（指数增长）
+SERVER_ERROR_BACKOFF = 0.5       # 5xx/429 重试的线性退避基数（秒）
+CHAPTER_DELAY = 0.8              # 请求间隔（秒），由 RateLimiter 自适应调整
 JITTER = 0.4                     # 随机抖动上限（秒），避免请求节奏过于机械
 MAX_PAGES_PER_CHAPTER = 50       # 单章最多翻页数，防御死循环
 PROGRESS_EVERY = 10              # 每下载 N 章打印一次阶段进度
+MAX_TOC_PAGES = 200              # 目录分页最多翻页数（--all-pages）
 
-# 正文容器候选选择器：按优先级找到候选，再结合正文长度择优
-CONTENT_SELECTORS = (
-    "#content",
-    "#chaptercontent",
-    "#booktxt",
-    "#txtContent",
-    "#read-content",
-    ".content",
-    ".showtxt",
-    ".read-content",
-    ".book-content",
-    ".novel-content",
-    ".article-content",
-    ".text",
-    ".read-content > div",
-    "article",
-)
-
-# 块级标签：get_text 时在这些元素前后断行
-BLOCK_TAGS = frozenset(
-    "p div br li dd dt h1 h2 h3 h4 h5 h6 tr table section article blockquote pre".split()
-)
-
-# 整个元素删除（连同子节点），这些标签从不属于正文
-DROP_TAGS = (
-    "script", "style", "ins", "iframe", "noscript", "svg", "canvas",
-    "form", "button", "input", "select", "textarea", "nav", "aside",
-    "audio", "video", "object", "embed", "link", "meta",
-)
-DROP_SELECTORS = (
-    ".read-inline-img", ".ad", ".ads", ".advert", ".advertisement",
-    ".gg", ".gg200x300", ".bdshare", ".share", ".bottem", ".page_chapter",
-    ".report", ".readfoot", ".foot", ".footer", ".breadcrumb", ".crumbs",
-)
-
-# 广告/推广行判定使用的常量
-AD_MAX_LINE_LEN = 80          # 超过该长度的行不做关键字判定，避免误伤正文句子
-AD_DOMAINS = (                # 命中即视为广告（网址/站点名）
-    ".com", ".net", ".org", ".cc", ".cn", ".vip", ".la", ".tv", ".info",
-    ".xyz", ".top", ".pw", ".me", ".io", ".us", ".co", "http://", "https://",
-    "www.", "wap.", "m.",
-)
-NAV_WORDS = frozenset(         # 纯导航行判定用词
-    "上一章 下一章 上一页 下一页 返回目录 目录 加入书签 章节目录 推荐本书".split()
-)
-AD_KEYWORDS = (                # 命中即视为广告的推广词
-    "本站首发", "首发于", "最快更新", "请记住本书", "请收藏本站", "求收藏",
-    "求推荐票", "求月票", "手机版阅读网址", "手机阅读", "手机用户请",
-    "章节错误", "点此举报", "举报后", "温馨提示", "手机浏览器", "电脑版",
-    "加入书签", "推荐本书", "投推荐票", "笔趣", "书海阁", "书号小说",
-    "八一中文", "新笔趣", "顶点小说",
-)
-# 看起来像网址的整行
-URL_LINE_RE = re.compile(
-    r"^(?:https?://|www\.|wap\.|m\.)\S*$|^[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,6}(?:/\S*)?$",
-    re.IGNORECASE,
-)
-# 纯符号行，或「上一章 | 下一章 | 目录」类导航行
-NAV_LINE_RE = re.compile(
-    r"^[\s\-—_=*·•|/\\<>《》\[\]【】()（）,，.。:：]+$"
-    r"|^(?:上一章|下一章|上一页|下一页|目录|返回目录|加入书签|章节目录|推荐本书)$",
-    re.IGNORECASE,
-)
-NAV_SPLIT_RE = re.compile(r"[\s|/·•<>《》【】\[\]()（）\-—_]+")
-
-# 目录链接文本：匹配「第X章」「第X节」「正文」「楔子」等
-CHAPTER_TITLE_RE = re.compile(
-    r"^\s*(?:第[0-9零一二三四五六七八九十百千万两〇]+[章节回卷]|正文|楔子|序章|序言|前言|引子)"
-)
+# 章节 URL 到基础 URL、分页序号的解析
 # 章节 URL 到基础 URL、分页序号的解析
 CHAPTER_URL_RE = re.compile(r"^(?P<base>.+?)(?:-(?P<page>\d+))?(?P<ext>\.s?html?)$", re.IGNORECASE)
 
@@ -177,6 +128,15 @@ class WafVerificationRequired(RuntimeError):
 
 class RobotsDisallowed(RuntimeError):
     """robots.txt 禁止爬取。"""
+
+
+class _HttpStatusError(ConnectionError):
+    """服务器在重试耗尽后仍返回错误状态码。"""
+
+    def __init__(self, status: int, url: str) -> None:
+        self.status = status
+        self.url = url
+        super().__init__(f"HTTP {status}：{url}")
 
 
 class ImageDecodeError(Exception):
@@ -229,121 +189,12 @@ def is_captcha_page(soup: BeautifulSoup, url: str) -> bool:
     return "验证码" in body_text and "请输入" in body_text
 
 
-def block_text(node) -> str:
-    """按文本块取文字：块与块之间换行，块内 <br> 转换行（避免把段落切碎）。"""
-    parts: list[str] = []
-    for text in node.strings:
-        parent_name = text.parent.name if text.parent else ""
-        if parent_name in ("br",):
-            parts.append("\n")
-            continue
-        block = parent_name in BLOCK_TAGS
-        value = str(text)
-        if block:
-            parts.append("\n" + value + "\n")
-        else:
-            parts.append(value)
-    return "".join(parts)
-
-
-def strip_boilerplate(container) -> None:
-    """删除正文容器内的广告/脚本/无关元素（就地修改）。"""
-    for tag in container.find_all(DROP_TAGS):
-        tag.decompose()
-    for selector in DROP_SELECTORS:
-        for tag in container.select(selector):
-            tag.decompose()
-
-
-def is_ad_line(line: str) -> bool:
-    """判断一行是否为广告/导航/网址等非正文内容。"""
-    if not line or NAV_LINE_RE.search(line):
-        return True
-    if URL_LINE_RE.match(line):
-        return True
-    if len(line) > AD_MAX_LINE_LEN:
-        return False
-    lowered = line.lower()
-    if any(domain in lowered for domain in AD_DOMAINS):
-        return True
-    if any(keyword in lowered for keyword in AD_KEYWORDS):
-        return True
-    # 「上一章 | 下一章 | 目录」这类只含导航词的短行
-    parts = [p for p in NAV_SPLIT_RE.split(line) if p]
-    if parts and all(p in NAV_WORDS for p in parts):
-        return True
-    # 一行里塞了多个链接（<a> 被 get_text 拼接后）
-    if len(re.findall(r"(https?://|www\.)", lowered)) >= 2:
-        return True
-    return False
-
-
-def clean_content(raw_text: str) -> str:
-    """把正文原始文本清理为干净的段落文本（广告过滤核心）。"""
-    text = normalize_text(raw_text)
-    # 去掉内联脚本残留，以及残留的 <br>/其它内联标签
-    text = re.sub(r"function\s+\w+\s*\([^)]*\)\s*\{[^{}]*\}\s*", "\n", text)
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"</?[a-zA-Z][^>]{0,80}>", "", text)
-
-    lines: list[str] = []
-    for raw_line in text.split("\n"):
-        line = raw_line.strip()
-        if not line:
-            continue
-        line = re.sub(r"[ \t]{2,}", " ", line)
-        if is_ad_line(line):
-            continue
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def extract_content(soup: BeautifulSoup) -> str:
-    """从章节页面中提取正文；找不到正文返回空字符串。"""
-    container = None
-    best_score = -1
-    for selector in CONTENT_SELECTORS:
-        for node in soup.select(selector):
-            text_len = len(re.sub(r"\s", "", node.get_text()))
-            if text_len < 50:
-                continue
-            link_len = sum(len(a.get_text(strip=True)) for a in node.find_all("a"))
-            # 跳过链接文字占一半以上的外层布局容器
-            if link_len > 0.5 * text_len:
-                continue
-            if text_len > best_score:
-                best_score, container = text_len, node
-
-    if container is not None:
-        strip_boilerplate(container)
-        text = clean_content(block_text(container))
-        if text:
-            return text
-
-    # 兜底：整个 body 去杂质后，取连续的长段落
-    body = soup.body or soup
-    strip_boilerplate(body)
-    text = clean_content(block_text(body))
-    lines = [line for line in text.split("\n") if len(line) >= 4]
-    joined = "\n".join(lines)
-    return joined if len(joined) >= 100 else ""
-
-
-def page_chapter_title(soup: BeautifulSoup) -> str:
-    """从章节页提取当前页所属章节的标题。"""
-    node = soup.select_one(".bookname h1, h1, #title, .title, .read-article h1, .content h1")
-    if node is None:
-        title = soup.find("title")
-        return title.get_text(" ", strip=True) if title else ""
-    return node.get_text(" ", strip=True)
-
-
 def split_page_url(url: str) -> tuple[str, str, str]:
-    """把 URL 拆成 (去掉扩展名的主体, 扩展名, 已有分页后缀)。"""
+    """把 URL 拆成 (去掉扩展名的部分, 扩展名)。"""
     match = re.match(r"^(?P<stem>.+?)(?P<ext>\.s?html?)$", url, re.IGNORECASE)
     if not match:
-        return url, "", ""
-    return match.group("stem"), match.group("ext"), ""
+        return url, ""
+    return match.group("stem"), match.group("ext")
 
 
 _PAGE_SUFFIX_URL_RE = re.compile(r"^(?P<base>.+)-(?P<page>\d+)$")
@@ -361,37 +212,46 @@ def next_page_url(
     chapter_urls: tuple[str, ...],
     position: int,
 ) -> str | None:
-    """找章节下一分页：优先页面「下一页」链接，其次目录分页，最后数字后缀。
+    """找章节下一分页。
 
-    position 为 current_url 在 chapter_urls 中的下标；不在其中时为 -1。
-    目录只列了第一页时，按 chapter-N.html 规律推测下一页（第 1 章第 1 页的
-    常见结构），直到探测不到正文为止。
+    只有两种可靠来源：
+    1. 页面上真实的「下一页」链接；
+    2. 目录页显式列出的同章分页（xxx-2.html）。
+    不再按 URL 数字后缀预测：不少站点对不存在的页返回“残留内容页”而非 404，
+    预测会把别的内容拼进正文。
     """
-    # 1) 页面上的「下一页」链接（最可靠）
-    for a in soup.find_all("a", href=True):
-        if a.get_text(strip=True) in ("下一页", "下一頁", "下页", "下頁", "后一页", "后頁"):
-            candidate = requests.compat.urljoin(current_url, a["href"])
-            if candidate != current_url:
-                return candidate
-    # 2) 目录页已列出的分页
+    link = extract_next_page(soup, current_url)
+    if link is not None:
+        return link
     if 0 <= position < len(chapter_urls) - 1:
         return chapter_urls[position + 1]
-    # 3) 数字后缀：仅对本章已列出 -N 分页的情况生效（避免把 t0yp00p-102.html
-    #    误推成 t0yp00p-103.html —— 那是下一章）。
-    if not chapter_urls:
+    return None
+
+
+def _retry_after_seconds(resp: requests.Response) -> float | None:
+    """解析服务器 Retry-After 响应头（秒数形式）。"""
+    value = (resp.headers.get("Retry-After") or "").strip()
+    if not value:
         return None
-    stem, ext, _ = split_page_url(current_url)
-    if not ext:
+    try:
+        seconds = float(value)
+    except ValueError:
         return None
-    if not any(_has_page_suffix(u) for u in chapter_urls):
-        return None
-    suffix = _PAGE_SUFFIX_URL_RE.match(stem)
-    if suffix is None:
-        return f"{stem}-2{ext}"
-    page = int(suffix.group("page"))
-    if page >= MAX_PAGES_PER_CHAPTER:
-        return None
-    return f"{suffix.group('base')}-{page + 1}{ext}"
+    return max(0.0, min(seconds, 120.0))
+
+
+class _CachedResponse:
+    """缓存命中时返回的轻量响应对象，接口与 requests.Response 的常用部分一致。"""
+
+    __slots__ = ("url", "status_code", "text", "content", "encoding", "from_cache")
+
+    def __init__(self, url: str, html: str, status: int = 200) -> None:
+        self.url = url
+        self.status_code = status
+        self.text = html
+        self.content = html.encode("utf-8", "replace")
+        self.encoding = "utf-8"
+        self.from_cache = True
 
 
 # ---------------------------------------------------------------------------
@@ -406,10 +266,16 @@ class Settings:
     output: str = DEFAULT_OUTPUT
     cookies: str = "cookies.json"
     delay: float = CHAPTER_DELAY
+    workers: int = DEFAULT_WORKERS          # 并发线程数（v0.32）
+    cache_dir: str | None = None            # 页面缓存目录，None 表示不启用
+    all_pages: bool = False                 # 抓取目录页的全部分页
+    by_order: bool = False                  # 按目录顺序而非章号选章
     obey_robots: bool = True
     resume: bool = False
+    verify_throttle: bool = True            # 是否自动降速（测试时可关闭）
     sleep: Callable[[float], None] = time.sleep
     chapters: list[Chapter] = field(default_factory=list)
+    index_url: str = INDEX_URL
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +286,7 @@ class Settings:
 class NovelDownloader:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.index_url = settings.index_url or INDEX_URL
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -429,13 +296,20 @@ class NovelDownloader:
             }
         )
         # 重试在 fetch() 里手动控制，便于验证码流程插入
-        adapter = HTTPAdapter(max_retries=Retry(total=0))
+        adapter = HTTPAdapter(max_retries=Retry(total=0), pool_maxsize=MAX_WORKERS * 2)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         self.waf_verified = False
         self._cookies_path = Path(settings.cookies).expanduser()
         self._viewer_opened = False
+        # v0.32：自适应限速 + 可选的磁盘缓存
+        self.limiter = RateLimiter(delay=settings.delay, sleep=settings.sleep)
+        self.cache = PageCache(settings.cache_dir, enabled=bool(settings.cache_dir))
+        # 失败页的短时负缓存：同一运行内不重复请求已知失败的分页
+        self._failed: dict[str, _HttpStatusError] = {}
+        self._failed_lock = threading.Lock()
         self._load_cookies()
+
 
     # ---- Cookie 持久化 -------------------------------------------------
     def _load_cookies(self) -> None:
@@ -475,10 +349,25 @@ class NovelDownloader:
 
     # ---- HTTP -----------------------------------------------------------
     def fetch(self, url: str, *, referer: str | None = None, _retries: int = 0) -> requests.Response:
-        """GET 页面，自动重试，并处理 WAF 验证码页。"""
+        """GET 页面：限速、缓存、自动重试，并处理 WAF 验证码与限流。
+
+        线程安全：每次请求前经 RateLimiter 串行排队；requests.Session 内部
+        以 urllib3 连接池工作，多线程并发读取是安全的。
+        """
+        cached = self.cache.get(url)
+        if cached is not None:
+            html, status = cached
+            return _CachedResponse(url, html, status)
+
+        with self._failed_lock:
+            previous = self._failed.get(url)
+        if previous is not None:
+            raise previous
+
         headers = {"Referer": referer} if referer else {}
         last_error = ""
         while _retries <= MAX_RETRIES:
+            self.limiter.acquire()
             try:
                 resp = self.session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             except (ConnectionError, Timeout, ChunkedEncodingError) as exc:
@@ -491,21 +380,41 @@ class NovelDownloader:
                     continue
                 raise ConnectionError(f"{url} 连接失败（已重试 {MAX_RETRIES} 次）：{last_error}") from exc
 
-            if resp.status_code >= 500 and _retries < MAX_RETRIES:
-                _retries += 1
-                logging.warning("服务器错误 %s，%s 秒后重试 %d/%d：%s", resp.status_code, RETRY_BACKOFF ** _retries, _retries, MAX_RETRIES, url)
-                self.settings.sleep(RETRY_BACKOFF ** _retries)
-                continue
+            # 429 / 503 / 5xx：服务器限流或故障，自动降速并重试（404 不重试）
+            if resp.status_code == 429 or resp.status_code == 503 or resp.status_code >= 500:
+                if self.settings.verify_throttle and resp.status_code in (429, 503):
+                    self.limiter.report_throttled()
+                retry_after = _retry_after_seconds(resp)
+                if _retries < MAX_RETRIES:
+                    _retries += 1
+                    wait = retry_after if retry_after is not None else min(SERVER_ERROR_BACKOFF * _retries, 8.0)
+                    logging.warning(
+                        "服务器返回 %s，%s 秒后重试 %d/%d：%s",
+                        resp.status_code, wait, _retries, MAX_RETRIES, url,
+                    )
+                    self.settings.sleep(wait)
+                    continue
+                # 重试耗尽：明确报错，并记住该 URL，避免重试轮次重复请求
+                error = _HttpStatusError(resp.status_code, url)
+                with self._failed_lock:
+                    self._failed[url] = error
+                raise error
 
             resp.encoding = self._detect_encoding(resp)
             soup = BeautifulSoup(resp.text, "html.parser")
             if is_captcha_page(soup, str(resp.url)):
                 logging.info("检测到人机验证页面。")
+                self.limiter.report_captcha()
                 self._handle_verification(resp, soup)
                 return self.fetch(url, referer=referer, _retries=_retries)
             if not self.waf_verified:
                 self.waf_verified = True
                 self._save_cookies()
+            if resp.status_code == 200:
+                self.limiter.report_success()
+            if resp.status_code in (200, 404, 410):
+                # 404 也缓存：章节末尾的「下一页」探测只发一次请求
+                self.cache.put(url, resp.text, resp.status_code)
             return resp
         raise ConnectionError(f"{url} 请求失败：{last_error}")
 
@@ -765,69 +674,73 @@ class NovelDownloader:
 
     # ---- 目录页解析 -----------------------------------------------------
     def get_chapter_list(self, index_url: str) -> list[Chapter]:
-        """从目录页解析章节列表。
+        """解析目录页（v0.31：不依赖具体站点模板）。
 
-        规律（与目标站一致）：
-        - 目录页顶部常把「最新章节」重复列出一次，因此按 URL 去重；
-        - 分页链接形如 xxx-2.html，与 xxx.html 属于同一章：合并到同一章上；
-        - 章节按「第X章」中的数字排序，保证「第1章」确实是第一章，
-          而不是页面上排在前面的「最新章节」。
+        对任意小说站：先用 site_adapter 的多种容器模板找章节链接，
+        容器都不命中时退化为全页扫描；按 URL 去重（目录顶部常重复列出
+        「最新章节」），同一章的分页链接合并到同一章；最后按「第X章」
+        的数字排序，保证第 1 章真的是第一章。
+
+        ``--all-pages`` 时沿目录页的「下一页」继续抓取并合并。
         """
-        resp = self.fetch(index_url)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        base_url = str(resp.url)
+        entries: list[site_adapter.TocEntry] = []
+        visited: set[str] = set()
+        page_url: str | None = index_url
+        pages = 0
+        while page_url and pages < MAX_TOC_PAGES:
+            if page_url in visited:
+                break
+            visited.add(page_url)
+            resp = self.fetch(page_url)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            parsed = site_adapter.parse_toc_page(soup, str(resp.url))
+            pages += 1
+            entries.extend(parsed.entries)
+            # 默认只抓第一页目录；--all-pages 时沿「下一页」继续
+            page_url = parsed.next_page if self.settings.all_pages else None
 
-        anchors: list = []
-        for scope in soup.select("#list, .listmain, dl, .chapter-list, .book-chapter, .list, .book_list"):
-            anchors.extend(scope.find_all("a", href=True))
-        if not anchors:
-            anchors = soup.find_all("a", href=True)
+        if pages > 1:
+            logging.info("目录共抓取 %d 页。", pages)
 
-        def collect(candidates) -> dict[str, str]:  # url -> 标题
-            found: dict[str, str] = {}
-            for a in candidates:
-                href = a["href"].strip()
-                if href.startswith(("javascript:", "#", "mailto:", "tel:")):
-                    continue
-                url = requests.compat.urljoin(base_url, href)
-                if not CHAPTER_URL_RE.match(url):
-                    continue
-                title = a.get_text(" ", strip=True)
-                if not CHAPTER_TITLE_RE.match(title):
-                    continue
-                found.setdefault(url, title)
-            return found
+        # 按 URL 去重（保留首次出现，即正文目录的顺序）
+        unique: dict[str, site_adapter.TocEntry] = {}
+        for entry in entries:
+            unique.setdefault(entry.url, entry)
+        entries = list(unique.values())
 
-        found = collect(anchors) or collect(soup.find_all("a", href=True))
+        if not entries:
+            logging.warning(
+                "未能从目录页识别出章节链接（%s）。请确认传入的是目录页，"
+                "或该站目录需要登录/启用了反爬。可加 -v 查看解析细节。",
+                index_url,
+            )
+            return []
 
-        # 合并分页：优先按「标题」归组（同一章的多页链接标题相同，
-        # 目标站的分页链接形如 t0yp00p-96-2.html，章节 ID 本身也含数字，
-        # 因此不能靠 URL 里的数字后缀判断）。
-        chapters: dict[str, dict] = {}
-        for url, title in found.items():
-            key = normalised_title(title) or url
-            entry = chapters.setdefault(key, {"title": title, "urls": [], "number": chapter_number(title)})
-            entry["urls"].append(url)
+        # 合并同一章的分页：优先按标题归一化后分组（同一章各页标题相同），
+        # 其次按 URL 的 -N 后缀规则。
+        grouped: dict[str, dict] = {}
+        for entry in entries:
+            key = normalised_title(entry.title)
+            group = grouped.setdefault(key, {"title": entry.title, "urls": [], "number": chapter_number(entry.title)})
+            if entry.url not in group["urls"]:
+                group["urls"].append(entry.url)
 
-        ordered = list(chapters.values())
-        for entry in ordered:
-            urls = entry["urls"]
+        ordered = list(grouped.values())
+        for group in ordered:
+            urls = group["urls"]
             if len(urls) > 1:
                 urls.sort(key=lambda u: chapter_page_number(u, tuple(urls)))
 
-        # 有章节号的按序号排序；没有章节号的 (楔子/序章等) 按出现顺序排在前面
+        # 有章节号的按序号排序；无章节号的（楔子/序章/番外）按出现顺序排在前面
         def sort_key(item: tuple[int, dict]) -> tuple:
-            position, entry = item
-            return (0, position) if entry["number"] is None else (1, entry["number"])
+            position, group = item
+            return (0, position) if group["number"] is None else (1, group["number"])
 
         result = [
-            Chapter(entry["title"], tuple(entry["urls"]), index)
-            for index, (_, entry) in enumerate(sorted(enumerate(ordered), key=sort_key), 1)
+            Chapter(group["title"], tuple(group["urls"]), index)
+            for index, (_, group) in enumerate(sorted(enumerate(ordered), key=sort_key), 1)
         ]
-
         logging.info("目录解析完成：共 %d 章。", len(result))
-        if not result:
-            logging.warning("未能从目录页解析出任何章节，目录结构可能已变化。")
         return result
 
 
@@ -835,44 +748,96 @@ class NovelDownloader:
     def get_chapter_content(self, chapter: Chapter) -> str:
         """下载一章的所有分页并拼接正文。
 
-        分页顺序：页内「下一页」链接 → 目录中同章的其它分页 → （仅当本章
-        目录项带 -N 分页格式时）探测 -N+1，并用页面标题确认仍属于本章。
+        分页发现（必须串行，因为依赖页内「下一页」链接）：
+            -N 分页格式的章节会一路探测到页面没有正文为止。
+        正文抓取（并发）：已发现的分页用线程池并行请求，分页越多提速越明显
+        （小说站单章常有 10-50 页，串行抓取是大头）。
         """
-        contents: list[str] = []
+        pages, first_soups = self._discover_pages(chapter)
+        if not pages:
+            return ""
+
+        texts: dict[str, str] = {}
+        for url, soup in first_soups.items():
+            text = site_adapter.extract_content(soup)
+            if text:
+                texts[url] = text
+
+        remaining = [url for url in pages if url not in texts]
+        if remaining:
+            workers = max(1, min(self.settings.workers, len(remaining), 8))
+            if workers > 1:
+                results = run_ordered(
+                    list(enumerate(remaining)),
+                    lambda _i, url: self._fetch_page_text(url, pages),
+                    max_workers=workers,
+                )
+                for index, url in enumerate(remaining):
+                    value = results.values.get(index)
+                    if isinstance(value, str) and value:
+                        texts[url] = value
+            else:
+                for url in remaining:
+                    text = self._fetch_page_text(url, pages)
+                    if text:
+                        texts[url] = text
+
+        if not texts:
+            logging.warning("第 %s 章未找到正文：%s", chapter.index, chapter.urls[0])
+            return ""
+        return "\n\n".join(texts[url] for url in pages if url in texts)
+
+    def _fetch_page_text(self, url: str, pages: list[str]) -> str:
+        """抓取单个分页的正文（供并发调用）。"""
+        resp = self.fetch(url, referer=pages[0])
+        if resp.status_code in (404, 410):
+            return ""
+        soup = BeautifulSoup(resp.text, "html.parser")
+        return site_adapter.extract_content(soup)
+
+    def _discover_pages(self, chapter: Chapter) -> tuple[list[str], dict[str, BeautifulSoup]]:
+        """沿「下一页」发现本章全部分页。
+
+        返回 (按顺序的分页 URL 列表, 已抓取的页面 soup 缓存)。
+        """
+        pages: list[str] = []
+        soups: dict[str, BeautifulSoup] = {}
         visited: set[str] = set()
         expected = normalised_title(chapter.title)
         current: str | None = chapter.urls[0]
         position = 0
 
-        while current and len(visited) <= MAX_PAGES_PER_CHAPTER:
+        while current and len(visited) < MAX_PAGES_PER_CHAPTER:
             if current in visited:
                 break
             visited.add(current)
             resp = self.fetch(current, referer=chapter.urls[0])
-            soup = BeautifulSoup(resp.text, "html.parser")
-            page_title = page_chapter_title(soup)
-            # 推测出来的分页/「下一页」链接若标题已属于另一章，说明本章到头了
-            if page_title and position == -1 and normalised_title(page_title) != expected:
+            if resp.status_code in (404, 410):
                 break
-            text = extract_content(soup)
-            if text:
-                contents.append(text)
-            elif not contents:
-                logging.warning("第 %s 章未找到正文：%s", chapter.index, current)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            text = site_adapter.extract_content(soup)
+            if not text:
+                break  # 没有正文：本章到头
+            page_title = page_chapter_title(soup)
+            if page_title and position == -1 and normalised_title(page_title) != expected:
+                break  # 串到别的章节了
+            pages.append(current)
+            soups[current] = soup
 
             following = next_page_url(soup, current, chapter_urls=chapter.urls, position=position)
-            if following is None and position != -1 and chapter.urls and _has_page_suffix(chapter.urls[-1]):
-                following = next_page_url(soup, current, chapter_urls=chapter.urls, position=len(chapter.urls))
-            if following is None or following in visited:
+            if following is None:
+                # 页面没有「下一页」：本章结束。
+                # 注意：不能用 URL 数字后缀硬推 -N（站点对不存在的页可能返回
+                # 残留页面而不是 404，硬推会把别的内容拼进来）。
+                break
+            if following in visited:
                 break
             try:
                 position = chapter.urls.index(following)
             except ValueError:
                 position = -1
             current = following
-            self.settings.sleep(self._jitter(min(self.settings.delay, 0.5)))
-
-        return "\n\n".join(contents)
+        return pages, soups
 
     def _jitter(self, base: float) -> float:
         return base + random.uniform(0, JITTER) if base > 0 else 0.0
@@ -880,7 +845,7 @@ class NovelDownloader:
     # ---- 主流程 ---------------------------------------------------------
     def check_robots(self) -> bool:
         """检查 robots.txt 是否允许抓取目录页。"""
-        parts = urlsplit(INDEX_URL)
+        parts = urlsplit(self.index_url)
         robots_url = f"{parts.scheme}://{parts.netloc}/robots.txt"
         try:
             resp = self.session.get(robots_url, timeout=REQUEST_TIMEOUT)
@@ -890,26 +855,44 @@ class NovelDownloader:
             return True
         parser = urllib.robotparser.RobotFileParser()
         parser.parse(resp.text.splitlines())
-        return parser.can_fetch(USER_AGENT, INDEX_URL)
+        return parser.can_fetch(USER_AGENT, self.index_url)
 
     def iter_positions(self, total: int) -> Iterator[tuple[int, Chapter | None]]:
-        """按目录顺序遍历选定区间；超出目录范围的返回 (序号, None)。"""
-        last = min(self.settings.end or total, total)
-        for number in range(self.settings.start, last + 1):
-            pos = number - 1
-            yield number, (self.settings.chapters[pos] if pos < total else None)
+        """按「章号」遍历选定区间，产出 (章号, 章节或 None)。
+
+        - 默认按章号（标题里的「第X章」）匹配：目录缺章时，第 96 章就是缺的那章，
+          不会把后面的章节顶上来当第 96 章；
+        - ``--by-order`` 时按目录顺序取第 start..end 条，适合标题没有章号的站点。
+        """
+        settings = self.settings
+        if settings.by_order or not any(chapter_number(c.title) is not None for c in self.settings.chapters):
+            last = min(settings.end or total, total)
+            for number in range(settings.start, last + 1):
+                pos = number - 1
+                yield number, (settings.chapters[pos] if pos < total else None)
+            return
+
+        by_number: dict[int, Chapter] = {}
+        for chapter in settings.chapters:
+            number = chapter_number(chapter.title)
+            if number is not None:
+                by_number.setdefault(number, chapter)
+        last = settings.end if settings.end is not None else max(by_number, default=0)
+        for number in range(settings.start, last + 1):
+            yield number, by_number.get(number)
 
     def run(self, dry_run: bool = False) -> int:
         settings = self.settings
-        logging.info("目标目录：%s", INDEX_URL)
+        logging.info("目标目录：%s", self.index_url)
         logging.info("抓取范围：第 %s 章 ~ %s", settings.start, settings.end if settings.end else "末章")
+        if settings.workers > 1:
+            logging.info("并发线程：%d，请求间隔自适应（初始 %.1f 秒）", settings.workers, self.limiter.delay)
 
         if settings.obey_robots and not self.check_robots():
             raise RobotsDisallowed("站点 robots.txt 不允许抓取该页面；如确认可访问，请加 --ignore-robots。")
 
-        chapters = self.get_chapter_list(INDEX_URL)
+        chapters = self.get_chapter_list(self.index_url)
         if not chapters:
-            logging.error("目录解析为空，未获取到任何章节。")
             return 2
         settings.chapters = chapters
 
@@ -919,7 +902,8 @@ class NovelDownloader:
                 if chapter is None:
                     print(f"{number:>4}. [目录中不存在]")
                 else:
-                    print(f"{number:>4}. {chapter.title}  {chapter.urls[0]}" + (f"  (分页 {len(chapter.urls)})" if len(chapter.urls) > 1 else ""))
+                    extra = f"  (分页 {len(chapter.urls)})" if len(chapter.urls) > 1 else ""
+                    print(f"{number:>4}. {chapter.title}  {chapter.urls[0]}{extra}")
             return 0
 
         last = settings.end if settings.end is not None else len(chapters)
@@ -931,64 +915,55 @@ class NovelDownloader:
         done: dict[str, str] = {}
         if settings.resume:
             done = parse_existing_txt(out_path)
-            logging.info("断点续传：输出文件中已有 %d 章，将跳过。", len(done))
+            if done:
+                print(f"断点续传：输出文件中已有 {len(done)} 章，将跳过。", flush=True)
 
+        pending: list[tuple[int, Chapter]] = []
         collected: dict[int, tuple[str, str]] = {}
-        retry_pool: list[tuple[int, Chapter]] = []
-        pending = [(n, c) for n, c in targets.items() if c is not None]
-        for missing_number, chapter in targets.items():
+        for number, chapter in targets.items():
             if chapter is None:
-                report.missing.append(f"第 {missing_number} 章（目录不存在）")
-
-        for step, (number, chapter) in enumerate(pending, 1):
-            prefix = f"[{step}/{len(pending)}] 第 {number} 章 {chapter.title}"
-            if settings.resume and done.get(chapter_key(chapter.title), "").strip():
-                collected[number] = (chapter.title, done[chapter_key(chapter.title)])
-                print(f"{prefix}  (已存在，跳过)", flush=True)
+                report.missing.append(f"第 {number} 章")
                 continue
-            print(prefix, end="", flush=True)
-            try:
-                body = self.get_chapter_content(chapter)
-            except WafVerificationRequired:
-                print()
-                raise
-            except ConnectionError as exc:
-                print("  网络失败", flush=True)
-                logging.error("第 %d 章下载失败：%s", number, exc)
-                retry_pool.append((number, chapter))
-                continue
-            except Exception as exc:  # noqa: BLE001 - 单章异常不中断整本书
-                print("  解析异常", flush=True)
-                logging.error("第 %d 章异常（%s: %s）：%s", number, type(exc).__name__, str(exc)[:120], chapter.urls[0])
-                retry_pool.append((number, chapter))
-                continue
-
-            if body.strip():
-                collected[number] = (chapter.title, body.strip())
-                print(f"  {len(body):,} 字", flush=True)
+            cached_body = done.get(chapter_key(chapter.title), "").strip() if settings.resume else ""
+            if cached_body:
+                collected[number] = (chapter.title, cached_body)
             else:
-                print("  正文为空", flush=True)
+                pending.append((number, chapter))
+
+        if not pending:
+            logging.info("所有章节已在输出文件中。")
+
+        body_by_number = self._download_chapters(pending, settings.workers)
+
+        retry_pool: list[tuple[int, Chapter]] = []
+        for number, chapter in pending:
+            result = body_by_number.get(number)
+            if isinstance(result, str) and result.strip():
+                collected[number] = (chapter.title, result.strip())
+            else:
                 retry_pool.append((number, chapter))
 
-            if step % PROGRESS_EVERY == 0:
-                chars = sum(len(b) for _, b in collected.values())
-                print(f"---- 进度 {step}/{len(pending)}，已获取 {len(collected)} 章 / 约 {chars:,} 字 ----", flush=True)
-            settings.sleep(self._jitter(settings.delay))
-
-        # 失败章节再试一轮
+        # 失败章节再串行重试一轮（避免并发重试再次触发限流）
         if retry_pool:
             logging.info("重试失败章节：%d 章", len(retry_pool))
-            for number, chapter in retry_pool:
-                settings.sleep(self._jitter(max(settings.delay * 2, 2.0)))
-                print(f"[重试] 第 {number} 章 {chapter.title}", end="", flush=True)
+            for position, (number, chapter) in enumerate(retry_pool, 1):
+                # 已知的 4xx/5xx 分页不再浪费一轮重试
+                if chapter.urls[0] in self._failed:
+                    error = self._failed[chapter.urls[0]]
+                    print(f"[重试 {position}/{len(retry_pool)}] 第 {number} 章 {chapter.title}  跳过：{error}", flush=True)
+                    report.failed.append((chapter, str(error)))
+                    continue
+                settings.sleep(self._jitter(min(max(self.limiter.delay * 2, 0.5), 2.0)))
+                print(f"[重试 {position}/{len(retry_pool)}] 第 {number} 章 {chapter.title}", end="", flush=True)
                 try:
                     body = self.get_chapter_content(chapter)
                 except WafVerificationRequired:
                     print()
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    print(f"  仍失败：{type(exc).__name__}: {str(exc)[:120]}", flush=True)
-                    report.failed.append((chapter, f"{type(exc).__name__}: {str(exc)[:120]}"))
+                    reason = f"{type(exc).__name__}: {str(exc)[:120]}"
+                    print(f"  仍失败：{reason}", flush=True)
+                    report.failed.append((chapter, reason))
                     continue
                 if body.strip():
                     collected[number] = (chapter.title, body.strip())
@@ -999,9 +974,62 @@ class NovelDownloader:
 
         ordered = [(number, *collected[number]) for number in sorted(collected)]
         write_book(out_path, title=out_path.stem.replace("_", " "), ordered=ordered, start=settings.start, end=last)
-        summarize(report, ordered, out_path, len(pending))
+        summarize(report, ordered, out_path, len(pending), workers=settings.workers)
+        if settings.cache_dir:
+            logging.info(self.cache.stats())
         return 0 if not report.failed else 1
 
+    def _download_chapters(self, pending: list[tuple[int, Chapter]], workers: int) -> dict[int, str | Exception]:
+        """并发下载章节正文，返回 {章号: 正文(字符串) 或异常}。"""
+        total = len(pending)
+        if total == 0:
+            return {}
+        results: dict[int, str | Exception] = {}
+        finished = [0]
+        lock = threading.Lock()
+        start = time.monotonic()
+
+        step = max(1, min(PROGRESS_EVERY, total // 10 or 1))
+
+        def report(number: int) -> None:
+            with lock:
+                finished[0] += 1
+                count = finished[0]
+                ok = sum(1 for v in results.values() if isinstance(v, str) and v.strip())
+            if count % step and count != total:
+                return
+            elapsed = max(time.monotonic() - start, 1e-6)
+            rate = count / elapsed
+            print(
+                f"---- 进度 {count}/{total}，成功 {ok} 章，{rate:.1f} 章/秒 ----",
+                flush=True,
+            )
+
+        def worker(number: int, chapter: Chapter) -> str | Exception:
+            try:
+                return self.get_chapter_content(chapter)
+            except WafVerificationRequired as exc:
+                return exc
+            except Exception as exc:  # noqa: BLE001 - 单章失败不影响其它章
+                logging.debug("第 %d 章下载异常：%s: %s", number, type(exc).__name__, exc)
+                return exc
+
+        def on_result(number: int, chapter: Chapter, value: object, error: Exception | None) -> None:
+            if error is not None:
+                results[number] = error
+            elif isinstance(value, BaseException):
+                results[number] = value
+            elif isinstance(value, str) and value.strip():
+                results[number] = value
+            report(number)
+
+        print(f"开始并发下载 {total} 章（{min(workers, total)} 个线程）……", flush=True)
+        run_ordered(pending, lambda number, chapter: worker(number, chapter), max_workers=workers, on_result=on_result)
+
+        captcha = [v for v in results.values() if isinstance(v, WafVerificationRequired)]
+        if captcha:
+            raise WafVerificationRequired(str(captcha[0]))
+        return results
 
 # ---------------------------------------------------------------------------
 # 输出与恢复
@@ -1099,12 +1127,19 @@ def write_book(path: Path, *, title: str, ordered: list[tuple[int, str, str]], s
         raise
 
 
-def summarize(report: DownloadReport, ordered: list[tuple[int, str, str]], path: Path, requested: int) -> None:
+def summarize(
+    report: DownloadReport,
+    ordered: list[tuple[int, str, str]],
+    path: Path,
+    requested: int,
+    *,
+    workers: int = 1,
+) -> None:
     chars = sum(len(body) for _, _, body in ordered)
     print()
     print("=" * 62)
     print(f"完成：应有 {requested} 章，成功 {len(ordered)} 章，失败 {len(report.failed)} 章。")
-    print(f"正文约 {chars:,} 字")
+    print(f"正文约 {chars:,} 字" + (f"（并发 {workers} 线程）" if workers > 1 else ""))
     print(f"输出文件：{path.resolve()}")
     if report.missing:
         print("目录中不存在：" + "、".join(report.missing[:10]))
@@ -1187,17 +1222,34 @@ def is_chapter_heading(line: str) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="从小说站点抓取章节并合并为 TXT 文件。")
-    parser.add_argument("--start", type=int, default=DEFAULT_START, help=f"起始章节（默认 {DEFAULT_START}）")
-    parser.add_argument("--end", type=int, default=DEFAULT_END, help=f"结束章节，含（默认 {DEFAULT_END}）")
+    parser = argparse.ArgumentParser(
+        description="从小说站点抓取章节并合并为 TXT 文件（v0.3：任意小说站 + 并发下载）。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例：\n"
+            "  python novel_download.py --url https://example.com/book/123.html\n"
+            "  python novel_download.py --url ... --start 1 --end 100 -o out.txt\n"
+            "  python novel_download.py --url ... --all --workers 8 --cache-dir .cache\n"
+        ),
+    )
+    parser.add_argument("--url", default=None, help="任意小说站的目录页地址（默认使用内置目标站）")
+    parser.add_argument("--start", type=int, default=None, help=f"起始章节（默认 {DEFAULT_START}）")
+    parser.add_argument("--end", type=int, default=None, help=f"结束章节，含（默认 {DEFAULT_END}）")
     parser.add_argument("--all", action="store_true", help="抓取目录中的全部章节（忽略 --start/--end）")
+    parser.add_argument("--all-pages", action="store_true", help="目录有多页时抓取全部分页")
+    parser.add_argument("--by-order", action="store_true", help="按目录顺序取第 N 条，而不是按「第X章」章号（默认按章号）")
     parser.add_argument("-o", "--output", default=None, help="输出文件路径")
-    parser.add_argument("--delay", type=float, default=CHAPTER_DELAY, help=f"章节请求间隔秒数（默认 {CHAPTER_DELAY}）")
+    parser.add_argument(
+        "--workers", type=int, default=DEFAULT_WORKERS,
+        help=f"并发下载线程数（默认 {DEFAULT_WORKERS}，范围 1-{MAX_WORKERS}）",
+    )
+    parser.add_argument("--delay", type=float, default=CHAPTER_DELAY, help=f"请求间隔秒数上限起点（默认 {CHAPTER_DELAY}，自动自适应）")
+    parser.add_argument("--cache-dir", default=None, help="页面缓存目录（可选，重跑时跳过已抓页面）")
     parser.add_argument("--cookies", default="cookies.json", help="WAF 验证 Cookie 保存路径（默认 cookies.json）")
     parser.add_argument("--dry-run", action="store_true", help="只解析目录并打印章节列表，不下载正文")
     parser.add_argument("--resume", action="store_true", help="断点续传：跳过输出文件中已有正文的章节")
     parser.add_argument("--ignore-robots", action="store_true", help="忽略 robots.txt 限制")
-    parser.add_argument("--base-url", default=None, help="站点根地址（默认使用脚本内置目标站，测试用）")
+    parser.add_argument("--base-url", default=None, help="站点根地址（若 --url 未给出时的默认站，测试用）")
     parser.add_argument("-v", "--verbose", action="store_true", help="输出调试日志")
     return parser
 
@@ -1207,20 +1259,29 @@ def build_settings(args: argparse.Namespace) -> Settings:
         start, end = 1, None
         output = args.output or "小说_全部章节.txt"
     else:
-        if args.start < 1:
+        start = DEFAULT_START if args.start is None else args.start
+        end = DEFAULT_END if args.end is None else args.end
+        if start < 1:
             raise ValueError("--start 必须 >= 1")
-        if args.end is not None and args.end < args.start:
+        if end is not None and end < start:
             raise ValueError("--end 不能小于 --start")
-        start, end = args.start, args.end
-        output = args.output or f"小说_{start}-{end if end is not None else '末' }章.txt"
+        output = args.output or f"小说_{start}-{end if end is not None else '末'}章.txt"
+    workers = max(1, min(MAX_WORKERS, args.workers))
+    if args.workers != workers:
+        logging.warning("--workers=%d 超出范围，已调整为 %d。", args.workers, workers)
     return Settings(
         start=start,
         end=end,
         output=output,
         cookies=args.cookies,
         delay=max(0.0, args.delay),
+        workers=workers,
+        cache_dir=args.cache_dir,
+        all_pages=args.all_pages,
+        by_order=args.by_order,
         obey_robots=not args.ignore_robots,
         resume=args.resume,
+        index_url=args.url or INDEX_URL,
     )
 
 
@@ -1231,8 +1292,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s: %(message)s",
         stream=sys.stderr,
     )
+    global BASE_URL, INDEX_URL
     if args.base_url:
-        global BASE_URL, INDEX_URL
         BASE_URL = args.base_url.rstrip("/")
         INDEX_URL = f"{BASE_URL}/book/t0yp00p.html"
     try:
@@ -1257,6 +1318,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n已中断，未写出不完整的文件。", file=sys.stderr)
         return 130
+    finally:
+        downloader.session.close()
 
 
 if __name__ == "__main__":

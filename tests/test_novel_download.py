@@ -18,12 +18,15 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from bs4 import BeautifulSoup
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mock_server  # noqa: E402
 import novel_download as nd  # noqa: E402
+import site_adapter  # noqa: E402
 from mock_server import start_in_thread  # noqa: E402
 
 
@@ -81,7 +84,7 @@ class UnitTests(unittest.TestCase):
         章节错误，点此举报
         　　他抬头望向云海，心中一片宁静。
         """
-        cleaned = nd.clean_content(raw)
+        cleaned = site_adapter.clean_content(raw)
         self.assertIn("非淡泊无以明志", cleaned)
         self.assertIn("他抬头望向云海", cleaned)
         for ad in ("本站首发", "手机版阅读网址", "上一章", "www.shuhaoxs.com", "ad.example.com", "举报"):
@@ -89,7 +92,7 @@ class UnitTests(unittest.TestCase):
 
     def test_clean_content_keeps_long_paragraph_with_incidental_word(self):
         line = "他们一路疾驰，终于在天亮前抵达了那座小城，" * 3 + "城门上写着「www」三个字（" + "x" * 40 + "）"
-        self.assertFalse(nd.is_ad_line(line))
+        self.assertFalse(site_adapter.is_ad_line(line))
 
     def test_chapter_title_regex(self):
         for title in ("第一章 起点", "第12章 abc", "第一百零五章 结局", "正文 楔子", "序章"):
@@ -98,18 +101,18 @@ class UnitTests(unittest.TestCase):
             self.assertFalse(nd.CHAPTER_TITLE_RE.match(title), title)
 
     def test_next_page_urls(self):
-        soup = nd.BeautifulSoup('<a href="/b/c-2.html">下一页</a>', "html.parser")
+        soup = BeautifulSoup('<a href="/b/c-2.html">下一页</a>', "html.parser")
         # 页内「下一页」链接最可靠
         self.assertEqual(nd.next_page_url(soup, "http://x/b/c.html", chapter_urls=(), position=-1), "http://x/b/c-2.html")
 
-        soup2 = nd.BeautifulSoup("<p>无链接</p>", "html.parser")
+        soup2 = BeautifulSoup("<p>无链接</p>", "html.parser")
         # 目录列出的分页
         paged = ("http://x/b/c.html", "http://x/b/c-2.html", "http://x/b/c-3.html")
         self.assertEqual(nd.next_page_url(soup2, paged[0], chapter_urls=paged, position=0), paged[1])
         self.assertEqual(nd.next_page_url(soup2, paged[1], chapter_urls=paged, position=1), paged[2])
-        # 已是最后一页：触发后缀探测（position == len）
-        self.assertEqual(nd.next_page_url(soup2, paged[2], chapter_urls=paged, position=3), "http://x/b/c-4.html")
-        # 没有分页格式的章节不做推测，避免抓到下一章
+        # 目录分页也用完、页面又没有「下一页」：不再按 URL 后缀硬推。
+        # （真实站点对不存在的 -N 页会返回残留内容而非 404，硬推会拼进别的内容）
+        self.assertIsNone(nd.next_page_url(soup2, paged[2], chapter_urls=paged, position=3))
         self.assertIsNone(nd.next_page_url(soup2, "http://x/b/t0yp00p-102.html", chapter_urls=("http://x/b/t0yp00p-102.html",), position=1))
         self.assertIsNone(nd.next_page_url(soup2, "http://x/b/c.html", chapter_urls=("http://x/b/c.html",), position=1))
 
@@ -237,7 +240,8 @@ class EndToEndTests(MockSiteTestCase):
         self.assertEqual(code, 0, log)
         code, log = self.run_cli("--start", "1", "--end", "3", "--output", str(out), "--resume")
         self.assertEqual(code, 0, log)
-        self.assertIn("已存在，跳过", log)
+        self.assertIn("断点续传", log)
+        self.assertIn("开始并发下载 2 章", log)  # 第 1 章已存在，只下载第 2、3 章
         text = out.read_text(encoding="utf-8")
         for n in (1, 2, 3):
             self.assertEqual(len(re.findall("^" + re.escape(mock_server.chapter_title(n)) + "$", text, re.M)), 1, f"第 {n} 章应只出现一次标题")

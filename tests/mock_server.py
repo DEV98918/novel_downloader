@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import html
 import random
+import re
 import struct
 import threading
 import zlib
@@ -143,6 +144,64 @@ def index_html() -> str:
 </body></html>"""
 
 
+# ---------------------------------------------------------------------------
+# 第二种站点模板：/alt/ 前缀，目录用 <ul class="chapter">，正文用 #chaptercontent
+# 用于验证「任意小说站」的通用识别能力（无 WAF，URL 结构也不同）
+# ---------------------------------------------------------------------------
+
+ALT_TOTAL = 12
+ALT_BOOK = 1234
+
+
+def alt_chapter_title(n: int) -> str:
+    return f"第{cn_number(n)}章 另一站章节{n}"
+
+
+def alt_paragraph(n: int, p: int) -> str:
+    return (
+        f"另一站的第{n}章第{p}段。夜色如墨，长街尽头一盏孤灯明灭不定，"
+        f"他握紧手中旧剑，低声念道「路漫漫其修远兮」。" + "风" * 20
+    )
+
+
+def alt_index_html() -> str:
+    items = []
+    for n in range(1, ALT_TOTAL + 1):
+        items.append(f'<li><a href="/alt/read/{ALT_BOOK}/{n}.html" title="{html.escape(alt_chapter_title(n))}">{html.escape(alt_chapter_title(n))}</a></li>')
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>另一站测试小说</title></head>
+<body>
+<div class="top-nav"><a href="/alt/">首页</a> <a href="/alt/book/{ALT_BOOK}/">排行榜</a></div>
+<div class="book-info"><h1>另一站测试小说</h1></div>
+<div class="volume"><h3>第一卷 少年游</h3>
+<ul class="chapter">
+{"".join(items)}
+</ul>
+</div>
+<div class="footer"><a href="/alt/">返回首页</a></div>
+</body></html>"""
+
+
+def alt_chapter_html(n: int) -> str:
+    title = alt_chapter_title(n)
+    paras = "\n".join(f"<p>{alt_paragraph(n, p)}</p>" for p in range(1, 4))
+    prev_link = f'<a href="/alt/read/{ALT_BOOK}/{n - 1}.html">上一章</a>' if n > 1 else ""
+    next_link = f'<a href="/alt/read/{ALT_BOOK}/{n + 1}.html">下一章</a>' if n < ALT_TOTAL else ""
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{html.escape(title)} - 另一站</title></head>
+<body>
+<div class="header"><a href="/alt/">首页</a></div>
+<h2 class="chapter-name">{html.escape(title)}</h2>
+<div id="chaptercontent" class="read-content">
+{paras}
+<p>本章由「另一站」原创发布，禁止转载。www.another-site.example.com</p>
+<p>最新网址：m.another-site.example.com</p>
+</div>
+<div class="page-links">{prev_link} <a href="/alt/">目录</a> {next_link}</div>
+<div class="copyright">Copyright 另一站</div>
+</body></html>"""
+
+
 def captcha_html(info: str, captcha_id: str, wrong: bool = False) -> str:
     """GoEdge WAF 验证页：验证码只存在于图片中（与真实站点一致）。"""
     prompt = '<p id="ui-captcha-image-prompt">验证码错误，请重试</p>' if wrong else '<p id="ui-captcha-image-prompt">loading ...</p>'
@@ -257,7 +316,8 @@ class MockHandler(BaseHTTPRequestHandler):
             self.send_html(captcha_html(info, captcha_id))
             return
 
-        if not self.authorized():
+        # /alt/ 站点无 WAF，直接放行
+        if not path.startswith("/alt") and not self.authorized():
             self.redirect_to_captcha(path)
             return
 
@@ -267,6 +327,19 @@ class MockHandler(BaseHTTPRequestHandler):
         if path in self.state.fail_once:
             self.state.fail_once.discard(path)
             self.send_html("temporarily unavailable", status=503)
+            return
+
+        # 第二种模板站点：无 WAF，独立路径
+        if path in (f"/alt/book/{ALT_BOOK}.html", f"/alt/book/{ALT_BOOK}/", "/alt/", "/alt"):
+            self.send_html(alt_index_html())
+            return
+        m = re.match(rf"^/alt/read/{ALT_BOOK}/(\d+)\.html$", path)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= ALT_TOTAL:
+                self.send_html(alt_chapter_html(n))
+                return
+            self.send_html("<html><head><title>404</title></head><body>页面不存在</body></html>", status=404)
             return
 
         if path == f"/book/{BOOK_ID}.html":
