@@ -14,6 +14,11 @@ and merges the chosen chapters into a single `.txt` file.
 **v0.2** targets one site. **v0.3** works on *any* novel site and is much faster.
 
 ### Features
+- **Chapters beyond the default range**: many sites' catalog pages list only the
+  first 100 chapters and load the rest through a "1-100 / 101-200 / ..." dropdown
+  that calls an encrypted AJAX endpoint. The script detects that dropdown, reads the
+  site's AES key/IV and endpoint, and fetches **every** range automatically — so
+  `--start 101 --end 200` works even though those chapters are not on the page.
 - **Any novel site (v0.31)**: pass any catalog URL with `--url`. The catalog and
   article body are located with multi-template candidates plus structural
   heuristics (text density, link density, paragraph count) — no per-site selectors
@@ -62,6 +67,7 @@ python novel_download.py --url ... --resume                     # skip chapters 
 | `--url` | catalog page of any novel site (default: built-in site) |
 | `--start` / `--end` / `--all` | chapter range (default 1–100) / all chapters |
 | `--all-pages` | follow catalog "下一页" pages |
+| `--no-range-api` | do not fetch chapters behind a range dropdown |
 | `--by-order` | select by catalog position instead of chapter number |
 | `--workers N` | parallel threads, 1–16 (default 6) |
 | `--delay S` | initial per-thread request interval (default 0.8 s, adapts) |
@@ -89,6 +95,10 @@ python -m unittest discover -s tests -v
 **v0.2** 只能抓一个固定站点；**v0.3** 支持任意小说站，并大幅提速。
 
 ### 功能
+- **下载默认区间之外的章节**：很多小说站的目录页只列出前 100 章，其余章节由
+  「1-100 / 101-200 / ...」下拉菜单通过加密的 AJAX 接口异步加载。脚本会识别这个下拉菜单，
+  读取站点的 AES 密钥/IV 与接口地址，自动抓取**全部区间**——因此即使目录页上没有，
+  `--start 101 --end 200` 也能正常下载。
 - **任意小说站（v0.31）**：用 `--url` 传入任意小说站的目录页网址。目录与正文不再依赖
   写死的选择器，而是用「多模板候选 + 结构启发式」（文字密度、链接密度、段落数）自动识别。
   支持分页目录（`--all-pages`）。
@@ -132,6 +142,7 @@ python novel_download.py --url ... --resume                     # 跳过已保�
 | `--url` | 任意小说站的目录页（默认用内置站点） |
 | `--start` / `--end` / `--all` | 章节区间（默认 1–100）/ 全部章节 |
 | `--all-pages` | 跟随目录页「下一页」 |
+| `--no-range-api` | 不抓取分章下拉菜单后的章节 |
 | `--by-order` | 按目录顺序取章（默认按章号） |
 | `--workers N` | 并发线程数，1–16（默认 6） |
 | `--delay S` | 每线程初始请求间隔（默认 0.8 秒，自动调整） |
@@ -154,9 +165,18 @@ python novel_download.py --url ... --resume                     # 跳过已保�
 | 文件 | 作用 |
 | --- | --- |
 | `novel_download.py` | 主流程：HTTP、验证码、目录/章节调度、TXT 输出 |
+| `chapter_api.py` | 分章下拉菜单 + 加密章节列表接口 |
 | `site_adapter.py` | v0.31：通用目录与正文识别（纯函数，可单独测试） |
 | `concurrency.py` | v0.32：线程池执行器 + 自适应限速器 |
 | `page_cache.py` | v0.32：页面磁盘缓存 |
+
+### 分章区间接口说明
+- 脚本内置了目标站的加密接口配置（密钥/IV 来自站点自身前端 JS 的 `AESCrypt`）。
+- 站点更新密钥后若失效，可用环境变量覆盖，无需改代码：
+  ```bash
+  export NOVEL_RANGE_API='{"endpoint":"/index.php?action=loadChapterPage","key":"<32位密钥>","iv":"<16位IV>"}'
+  ```
+- 对未混淆的站点 JS，脚本能自动解析出密钥与接口；解析不到时会给出明确提示并只下载默认区间。
 
 ### 测试
 离线测试运行在本地模拟站点上（两种不同模板 + WAF 验证码 + 限流场景）：

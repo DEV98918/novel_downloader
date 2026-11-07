@@ -68,6 +68,7 @@ except (AttributeError, OSError):
     pass
 
 # 通用站点适配（v0.31）与并发 / 限速 / 缓存（v0.32）
+import chapter_api
 import site_adapter
 from concurrency import RateLimiter, run_ordered
 from page_cache import PageCache
@@ -183,10 +184,19 @@ def is_captcha_page(soup: BeautifulSoup, url: str) -> bool:
     if soup.find("img", id="ui-captcha-image") is not None:
         return True
     title = soup.find("title")
-    if title and any(k in title.get_text() for k in ("身份验证", "安全验证", "人机验证")):
+    if title and any(k in title.get_text() for k in ("身份验证", "安全验证", "人机验证", "Verify Yourself")):
         return True
-    body_text = soup.get_text(" ")
-    return "验证码" in body_text and "请输入" in body_text
+    # 只靠文字判断容易误伤：JS 源码里也可能同时出现「验证码」「请输入」
+    # （实测站点的 public.js 就是如此），因此必须同时存在验证码图片/输入框。
+    has_input = soup.find("input", attrs={"name": re.compile("CAPTCHA|code", re.I)}) is not None
+    has_image = any(
+        "captcha" in ((img.get("src") or "") + " " + (img.get("id") or "")).lower()
+        for img in soup.find_all("img")
+    )
+    if has_input and (has_image or soup.find("form") is not None):
+        body_text = soup.get_text(" ")
+        return "验证码" in body_text or "verify" in body_text.lower()
+    return False
 
 
 def split_page_url(url: str) -> tuple[str, str, str]:
@@ -270,6 +280,7 @@ class Settings:
     cache_dir: str | None = None            # 页面缓存目录，None 表示不启用
     all_pages: bool = False                 # 抓取目录页的全部分页
     by_order: bool = False                  # 按目录顺序而非章号选章
+    no_range_api: bool = False              # 不抓取分章区间接口
     obey_robots: bool = True
     resume: bool = False
     verify_throttle: bool = True            # 是否自动降速（测试时可关闭）
@@ -693,10 +704,15 @@ class NovelDownloader:
             visited.add(page_url)
             resp = self.fetch(page_url)
             soup = BeautifulSoup(resp.text, "html.parser")
+            if pages == 0 and not self.settings.no_range_api:
+                # 目录页若带「分章区间」下拉（1-100/101-200...），只解析静态页
+                # 会漏掉后面的章节，这里改为走站点的分章接口。
+                extra = self._fetch_range_chapters(soup, str(resp.url))
+                entries.extend(extra)
             parsed = site_adapter.parse_toc_page(soup, str(resp.url))
             pages += 1
             entries.extend(parsed.entries)
-            # 默认只抓第一页目录；--all-pages 时沿「下一页」继续
+            # 静态目录分页：--all-pages 时沿「下一页」继续
             page_url = parsed.next_page if self.settings.all_pages else None
 
         if pages > 1:
@@ -743,6 +759,120 @@ class NovelDownloader:
         logging.info("目录解析完成：共 %d 章。", len(result))
         return result
 
+
+    def _fetch_range_chapters(self, soup: BeautifulSoup, page_url: str) -> list[site_adapter.TocEntry]:
+        """抓取「分章区间」下拉里的全部章节（如 101-200、201-300...）。
+
+        站点把后面的章节放在异步接口里（参数加密），只解析静态目录页只能拿到
+        默认的 1-100 章。这里识别下拉菜单 → 找到对应站点的加密接口配置 →
+        逐区间请求并合并。识别不到就返回空列表，流程退回静态目录。
+        """
+        menu = chapter_api.find_range_menu(soup)
+        if menu is None:
+            return []
+        book_id, options = menu
+        host = urlsplit(page_url).netloc
+        api = chapter_api.api_for_host(host)
+        if api is None:
+            api = chapter_api.parse_api_from_js(self._site_js_text(page_url, soup))
+        if api is None:
+            logging.warning(
+                "目录页有分章区间菜单（%s），但未识别到该站点的分章接口；"
+                "只能下载默认区间。可用 --no-range-api 关闭此提示。",
+                "、".join(opt.label for opt in options[:4]),
+            )
+            return []
+
+        base = f"{urlsplit(page_url).scheme}://{host}"
+        pages = [opt.page for opt in options]
+        logging.info(
+            "检测到分章区间菜单：%s，共 %d 个区间，开始抓取全部章节……",
+            "、".join(opt.label for opt in options),
+            len(pages),
+        )
+
+        def request_json(url: str, form: dict[str, str], headers: dict[str, str]) -> dict:
+            return self.fetch_json(url, form, headers, referer=page_url)
+
+        result = chapter_api.fetch_chapters(
+            api, book_id, request_json=request_json, pages=pages, base_url=base, referer=page_url
+        )
+        for error in result.errors:
+            logging.warning("%s", error)
+
+        # 下拉项的最大页码未必覆盖全部章节：继续探测，直到没有新章节
+        if not self.settings.no_range_api and result.chapters:
+            extra_pages = chapter_api.discover_pages(
+                api, book_id, request_json=request_json, base_url=base, referer=page_url,
+                max_pages=max(max(pages) + 20, 60),
+            )
+            extra_pages = [p for p in extra_pages if p not in pages]
+            if extra_pages:
+                more = chapter_api.fetch_chapters(
+                    api, book_id, request_json=request_json, pages=extra_pages,
+                    base_url=base, referer=page_url,
+                )
+                result.chapters.extend(more.chapters)
+                logging.info("菜单之外还有 %d 个区间，已一并抓取。", len(extra_pages))
+
+        logging.info("分章接口返回 %d 章。", len(result.chapters))
+        return [
+            site_adapter.TocEntry(title, requests.compat.urljoin(page_url, href), order)
+            for order, (title, href) in enumerate(result.chapters)
+        ]
+
+    def _site_js_text(self, page_url: str, soup: BeautifulSoup | None = None) -> str:
+        """尽力读取目录页引用的站点 JS，用于自动识别加密接口参数。"""
+        if soup is None:
+            try:
+                soup = BeautifulSoup(self.fetch(page_url).text, "html.parser")
+            except (ConnectionError, WafVerificationRequired):
+                return ""
+        texts: list[str] = []
+        for script in soup.find_all("script", src=True):
+            src = script["src"]
+            if not any(k in src.lower() for k in ("public", "common", "index", "main", "app")):
+                continue
+            try:
+                js = self.fetch(requests.compat.urljoin(page_url, src))
+            except (ConnectionError, WafVerificationRequired):
+                continue
+            if "AESCrypt" in js.text or "action=" in js.text:
+                texts.append(js.text)
+        return "\n".join(texts)
+
+    def fetch_json(
+        self, url: str, form: dict[str, str], headers: dict[str, str], *, referer: str = ""
+    ) -> dict:
+        """POST 一个 JSON 接口（供分章接口使用），带限速与重试。"""
+        merged = {"Referer": referer} if referer else {}
+        merged.update(headers)
+        merged.setdefault("X-Requested-With", "XMLHttpRequest")
+        last_error: Exception | None = None
+        for attempt in range(1, MAX_RETRIES + 2):
+            self.limiter.acquire()
+            try:
+                resp = self.session.post(url, data=form, headers=merged, timeout=REQUEST_TIMEOUT)
+            except (ConnectionError, Timeout, ChunkedEncodingError) as exc:
+                last_error = exc
+                if attempt <= MAX_RETRIES:
+                    self.settings.sleep(RETRY_BACKOFF ** attempt)
+                    continue
+                raise
+            if resp.status_code in (429, 503) or resp.status_code >= 500:
+                if self.settings.verify_throttle and resp.status_code in (429, 503):
+                    self.limiter.report_throttled()
+                last_error = _HttpStatusError(resp.status_code, url)
+                if attempt <= MAX_RETRIES:
+                    self.settings.sleep(min(SERVER_ERROR_BACKOFF * attempt, 8.0))
+                    continue
+                raise last_error
+            self.limiter.report_success()
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise ValueError(f"接口返回的不是 JSON：{resp.text[:120]}") from exc
+        raise last_error or ConnectionError(url)
 
     # ---- 章节页抓取 -----------------------------------------------------
     def get_chapter_content(self, chapter: Chapter) -> str:
@@ -1237,6 +1367,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end", type=int, default=None, help=f"结束章节，含（默认 {DEFAULT_END}）")
     parser.add_argument("--all", action="store_true", help="抓取目录中的全部章节（忽略 --start/--end）")
     parser.add_argument("--all-pages", action="store_true", help="目录有多页时抓取全部分页")
+    parser.add_argument("--no-range-api", action="store_true", help="不抓取分章区间（下拉菜单）里的后续章节")
     parser.add_argument("--by-order", action="store_true", help="按目录顺序取第 N 条，而不是按「第X章」章号（默认按章号）")
     parser.add_argument("-o", "--output", default=None, help="输出文件路径")
     parser.add_argument(
@@ -1279,6 +1410,7 @@ def build_settings(args: argparse.Namespace) -> Settings:
         cache_dir=args.cache_dir,
         all_pages=args.all_pages,
         by_order=args.by_order,
+        no_range_api=args.no_range_api,
         obey_robots=not args.ignore_robots,
         resume=args.resume,
         index_url=args.url or INDEX_URL,

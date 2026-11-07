@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import html
+import json
 import random
 import re
 import struct
@@ -241,6 +242,99 @@ def make_png(width: int = 120, height: int = 40, seed: int = 0) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
 
 
+# ---------------------------------------------------------------------------
+# 第三种模板：/range/ —— 目录只默认列出 1-100 章，其余章节通过分章下拉菜单 +
+# 加密接口（AES-CBC）动态加载，还原真实站点的机制。
+# ---------------------------------------------------------------------------
+
+RANGE_TOTAL = 260          # 共 260 章
+RANGE_PAGE_SIZE = 100      # 每个区间 100 章
+RANGE_BOOK_ID = "rangebook"
+RANGE_KEY = b"MockKeyForRangeApi0123456789abcd"   # 32 字节
+RANGE_IV = b"MockIv1234567890"
+
+
+def range_chapter_title(n: int) -> str:
+    return f"第{n}章 区间测试章节{n}"
+
+
+def range_chapter_url(n: int) -> str:
+    return f"/range/book/{RANGE_BOOK_ID}-{n}.html"
+
+
+def range_index_html() -> str:
+    """默认页：只列 1-100 章 + 分章下拉菜单。"""
+    items = "".join(
+        f'<li><a href="{range_chapter_url(n)}">{html.escape(range_chapter_title(n))}</a></li>'
+        for n in range(1, min(RANGE_PAGE_SIZE, RANGE_TOTAL) + 1)
+    )
+    pages = (RANGE_TOTAL + RANGE_PAGE_SIZE - 1) // RANGE_PAGE_SIZE
+    options = "".join(
+        f'<li data-p="{p}"{" class=\"cur\"" if p == 1 else ""}>{p * RANGE_PAGE_SIZE - RANGE_PAGE_SIZE + 1}-{p * RANGE_PAGE_SIZE}章</li>'
+        for p in range(1, pages + 1)
+    )
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>区间测试小说 - 书豪小说网</title></head>
+<body>
+<div class="listmain"><ul>{items}</ul></div>
+<div class="pageS font16">
+  <div class="selBox">
+    <div class="btn"><span class="txt">1-100章</span><span class="arr"></span></div>
+    <div class="dropDown" data-aid="{RANGE_BOOK_ID}"><ul>{options}</ul></div>
+  </div>
+</div>
+</body></html>"""
+
+
+def range_chapter_html(n: int) -> str:
+    title = range_chapter_title(n)
+    paras = "\n".join(f"<p>区间站第{n}章第{i}段，内容真实有效，足够长以通过正文判定。</p>" for i in range(1, 4))
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title></head>
+<body><h1>{html.escape(title)}</h1><div id="content">{paras}
+<p>请记住本书首发域名：www.range-mock.example.com</p></div></body></html>"""
+
+
+def encrypt_range_payload(book_id: str, page: int) -> str:
+    """与站点一致的 AES-CBC + PKCS7 + Base64。"""
+    import base64
+    import json as _json
+
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+
+    plain = _json.dumps({"id": book_id, "page": page}, separators=(",", ":")).encode()
+    return base64.b64encode(AES.new(RANGE_KEY, AES.MODE_CBC, RANGE_IV).encrypt(pad(plain, 16))).decode()
+
+
+def decrypt_range_payload(token: str) -> dict:
+    import base64
+    import json as _json
+
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import unpad
+
+    raw = AES.new(RANGE_KEY, AES.MODE_CBC, RANGE_IV).decrypt(base64.b64decode(token))
+    return _json.loads(unpad(raw, 16).decode())
+
+
+def range_api_response(data: dict) -> dict:
+    """构造 loadChapterPage 风格的 JSON 响应。"""
+    page = int(data.get("page", 1))
+    start = (page - 1) * RANGE_PAGE_SIZE + 1
+    end = min(page * RANGE_PAGE_SIZE, RANGE_TOTAL)
+    if start > RANGE_TOTAL:
+        return {"code": 0, "msg": "Success", "data": []}
+    items = [
+        {
+            "chaptername": range_chapter_title(n),
+            "chapterurl": range_chapter_url(n),
+            "chapterorder": str(n),
+        }
+        for n in range(start, end + 1)
+    ]
+    return {"code": 0, "msg": "Success", "data": items}
+
+
 class MockState:
     def __init__(self, total: int = TOTAL_CHAPTERS) -> None:
         self.total = total
@@ -272,6 +366,14 @@ class MockHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_json(self, payload: dict, status: int = 200) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
@@ -317,7 +419,7 @@ class MockHandler(BaseHTTPRequestHandler):
             return
 
         # /alt/ 站点无 WAF，直接放行
-        if not path.startswith("/alt") and not self.authorized():
+        if not path.startswith(("/alt", "/range")) and not self.authorized():
             self.redirect_to_captcha(path)
             return
 
@@ -327,6 +429,19 @@ class MockHandler(BaseHTTPRequestHandler):
         if path in self.state.fail_once:
             self.state.fail_once.discard(path)
             self.send_html("temporarily unavailable", status=503)
+            return
+
+        # 第三种模板：分章下拉菜单站点（默认只列 1-100 章）
+        if path in (f"/range/book/{RANGE_BOOK_ID}.html", f"/range/chapter/{RANGE_BOOK_ID}.html", f"/range/chapter/{RANGE_BOOK_ID}"):
+            self.send_html(range_index_html())
+            return
+        m_range = re.match(rf"^/range/book/{RANGE_BOOK_ID}-(\d+)\.html$", path)
+        if m_range:
+            n = int(m_range.group(1))
+            if 1 <= n <= RANGE_TOTAL:
+                self.send_html(range_chapter_html(n))
+                return
+            self.send_html("<html><head><title>404</title></head><body>页面不存在</body></html>", status=404)
             return
 
         # 第二种模板站点：无 WAF，独立路径
@@ -358,6 +473,15 @@ class MockHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length).decode("utf-8", "replace")
         form = {k: v[0] for k, v in parse_qs(raw).items()}
+        if parts.path == "/range/index.php" and parse_qs(parts.query).get("action") == ["loadChapterPage"]:
+            token = form.get("data", "")
+            try:
+                data = decrypt_range_payload(token)
+            except Exception:
+                self.send_json({"code": 1, "msg": "decrypt error", "data": []})
+                return
+            self.send_json(range_api_response(data))
+            return
         if not parts.path.startswith("/WAF/VERIFY/CAPTCHA"):
             self.send_html("not found", status=404)
             return
